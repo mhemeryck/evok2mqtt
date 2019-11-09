@@ -164,6 +164,7 @@ def main():
     _autodiscover_mqtt(configs)
 
     # Loop
+    _mqtt_client().loop_start()
     asyncio.get_event_loop().run_until_complete(
         ws_connect(args.evok_uri, configs, args.mqtt_payload_on, args.mqtt_payload_off)
     )
