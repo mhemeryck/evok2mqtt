@@ -209,7 +209,7 @@ def on_message(client, userdata, message):
 def _subscribe_outputs_mqtt():
     """Subscribe all configuration for outputs to MQTT topics"""
     for config in _settings().CONFIGS:
-        if config.unipi_dev in ("output"):
+        if config.unipi_dev in ("output", "relay"):
             _mqtt_client().subscribe(
                 MQTT_HASS_COMMAND_TOPIC_FORMAT.format(
                     hass_type=config.hass_type,
