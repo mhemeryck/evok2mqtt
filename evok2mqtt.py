@@ -6,11 +6,11 @@ import json
 import logging
 import logging.config
 import re
+import socket
 import sys
 
 import paho.mqtt.client as mqtt
 import websockets
-import yaml
 
 # Log setup
 LOG_LEVEL = logging.INFO
@@ -32,6 +32,18 @@ LOG_CONFIG = dict(
 logging.config.dictConfig(LOG_CONFIG)
 logger = logging.getLogger(__name__)
 
+# MQTT
+_MQTT_CLIENT = None
+MQTT_TOPIC_FORMAT = "{device_name}/{dev}/{circuit}/{hass_action}"
+MQTT_COMMAND_TOPIC_REGEX = re.compile(
+    r"^(?P<device_name>(\w+))/(?P<dev>(relay|output))/(?P<circuit>[0-9_]+)/set$"
+)
+
+
+class HASS_ACTION:
+    COMMAND = "set"
+    STATE = "state"
+
 
 _SETTINGS = None
 
@@ -39,29 +51,18 @@ _SETTINGS = None
 Settings = collections.namedtuple(
     "Settings",
     (
-        "UNIPI_NAME",
-        "EVOK_URI",
         "MQTT_HOST",
         "MQTT_PORT",
         "MQTT_PAYLOAD_ON",
         "MQTT_PAYLOAD_OFF",
-        "MQTT_PAYLOAD_ONLINE",
-        "MQTT_PAYLOAD_OFFLINE",
-        "CONFIGS",
+        "DEVICE_NAME",
+        "WEBSOCKET_URI",
     ),
 )
 
 
 def _set_settings(
-    unipi_name,
-    evok_uri,
-    mqtt_host,
-    mqtt_port,
-    mqtt_payload_on,
-    mqtt_payload_off,
-    mqtt_payload_online,
-    mqtt_payload_offline,
-    configs,
+    mqtt_host, mqtt_port, mqtt_payload_on, mqtt_payload_off, device_name, websocket_uri,
 ):
     """
     Put all settings in global scope, as they don't change after intialization
@@ -71,15 +72,12 @@ def _set_settings(
     if _SETTINGS is not None:
         logger.warning("Updating settings")
     _SETTINGS = Settings(
-        unipi_name,
-        evok_uri,
         mqtt_host,
         mqtt_port,
         mqtt_payload_on,
         mqtt_payload_off,
-        mqtt_payload_online,
-        mqtt_payload_offline,
-        configs,
+        device_name,
+        websocket_uri,
     )
 
 
@@ -90,42 +88,15 @@ def _settings():
     return _SETTINGS
 
 
-# Config
-Config = collections.namedtuple(
-    "Config", ("hass_name", "hass_type", "unipi_dev", "unipi_circuit")
-)
-
-
-def _read_config(filename):
-    logger.info("Reading input config from %s", filename)
-    with open(filename, "r") as fh:
-        return [Config(**line) for line in yaml.safe_load(fh)]
-
-
-def _config_maps(configs):
-    """Build dictionaries for mapping return values to configs"""
-    ws_to_mqtt = {}
-    for config in configs:
-        ws_to_mqtt[(config.unipi_dev, config.unipi_circuit)] = config
-    return ws_to_mqtt
-
-
-# Websockets
-async def _ws_process(payload, config_map):
+async def _ws_process(payload):
     """Process incoming websocket payload, push to MQTT"""
     obj = json.loads(payload)[0]
     logger.debug("Incoming message for websocket %s", obj)
-    try:
-        config = config_map[(obj["dev"], obj["circuit"])]
-    except KeyError:
-        return
 
-    logger.info("Matching config for %s and message %s", config, obj)
-    topic = MQTT_HASS_TOPIC_FORMAT.format(
-        hass_type=config.hass_type,
-        unipi_name=_settings().UNIPI_NAME,
-        unipi_dev=config.unipi_dev,
-        unipi_circuit=config.unipi_circuit,
+    topic = MQTT_TOPIC_FORMAT.format(
+        device_name=_settings().DEVICE_NAME,
+        dev=obj["dev"],
+        circuit=obj["circuit"],
         hass_action=HASS_ACTION.STATE,
     )
     payload = (
@@ -139,137 +110,27 @@ async def _ws_process(payload, config_map):
 
 async def _ws_loop():
     """Main loop polling incoming events from websockets"""
-    config_map = _config_maps(_settings().CONFIGS)
-    logger.info("Connecting to %s", _settings().EVOK_URI)
-    async with websockets.connect(_settings().EVOK_URI) as websocket:
+    logger.info("Connecting to %s", _settings().WEBSOCKET_URI)
+    async with websockets.connect(_settings().WEBSOCKET_URI) as websocket:
         while True:
             payload = await websocket.recv()
-            await _ws_process(payload, config_map)
+            await _ws_process(payload)
 
 
-async def _ws_trigger(unipi_dev, unipi_circuit, value):
-    """Send MQTT message for config with given value"""
-    async with websockets.connect(_settings().EVOK_URI) as websocket:
+async def _ws_trigger(dev, circuit, value):
+    """Send MQTT message to websocket"""
+    async with websockets.connect(_settings().WEBSOCKET_URI) as websocket:
         await websocket.send(
-            json.dumps(
-                {
-                    "cmd": "set",
-                    "dev": unipi_dev,
-                    "circuit": unipi_circuit,
-                    "value": value,
-                }
-            )
+            json.dumps({"cmd": "set", "dev": dev, "circuit": circuit, "value": value})
         )
-
-
-# MQTT
-_MQTT_CLIENT = None
-MQTT_HASS_TOPIC_FORMAT = (
-    "homeassistant/{hass_type}/{unipi_name}/{unipi_dev}_{unipi_circuit}/{hass_action}"
-)
-MQTT_HASS_COMAND_TOPIC_REGEX = re.compile(
-    r"^homeassistant/(?P<hass_type>(\w+))/(?P<unipi_name>(\w+))/(?P<unipi_dev>([a-zA-Z]+))\_(?P<unipi_circuit>[0-9_]+)/set$"
-)
-MQTT_HASS_START_TOPIC = "homeassistant/start"
-
-
-class HASS_ACTION:
-    CONFIG = "config"
-    COMMAND = "set"
-    STATE = "state"
-    AVAILABILITY = "availability"
 
 
 def _mqtt_client():
     """Singleton MQTT client"""
     global _MQTT_CLIENT
     if _MQTT_CLIENT is None:
-        _MQTT_CLIENT = mqtt.Client()
+        _MQTT_CLIENT = mqtt.Client(client_id=_settings().DEVICE_NAME)
     return _MQTT_CLIENT
-
-
-def _autodiscover_mqtt(client):
-    """Push MQTT autodiscovery settings to MQTT broker"""
-    for config in _settings().CONFIGS:
-        client.publish(
-            MQTT_HASS_TOPIC_FORMAT.format(
-                hass_type=config.hass_type,
-                unipi_name=_settings().UNIPI_NAME,
-                unipi_dev=config.unipi_dev,
-                unipi_circuit=config.unipi_circuit,
-                hass_action=HASS_ACTION.CONFIG,
-            ),
-            payload=json.dumps(
-                {
-                    "name": config.hass_name,
-                    "command_topic": MQTT_HASS_TOPIC_FORMAT.format(
-                        hass_type=config.hass_type,
-                        unipi_name=_settings().UNIPI_NAME,
-                        unipi_dev=config.unipi_dev,
-                        unipi_circuit=config.unipi_circuit,
-                        hass_action=HASS_ACTION.COMMAND,
-                    ),
-                    "state_topic": MQTT_HASS_TOPIC_FORMAT.format(
-                        hass_type=config.hass_type,
-                        unipi_name=_settings().UNIPI_NAME,
-                        unipi_dev=config.unipi_dev,
-                        unipi_circuit=config.unipi_circuit,
-                        hass_action=HASS_ACTION.STATE,
-                    ),
-                }
-            ),
-        )
-
-
-def _subscribe_outputs_mqtt(client):
-    """Subscribe all configuration for outputs to MQTT topics"""
-    for config in _settings().CONFIGS:
-        if config.unipi_dev in ("output", "relay"):
-            client.subscribe(
-                MQTT_HASS_TOPIC_FORMAT.format(
-                    hass_type=config.hass_type,
-                    unipi_name=_settings().UNIPI_NAME,
-                    unipi_dev=config.unipi_dev,
-                    unipi_circuit=config.unipi_circuit,
-                    hass_action=HASS_ACTION.COMMAND,
-                )
-            )
-
-
-def _toggle_availability(client, available):
-    """Assure that all devices are available"""
-    for config in _settings().CONFIGS:
-        client.publish(
-            MQTT_HASS_TOPIC_FORMAT.format(
-                hass_type=config.hass_type,
-                unipi_name=_settings().UNIPI_NAME,
-                unipi_dev=config.unipi_dev,
-                unipi_circuit=config.unipi_circuit,
-                hass_action=HASS_ACTION.AVAILABILITY,
-            ),
-            available,
-        )
-
-
-def _handle_output(client, message, hass_type, unipi_name, unipi_dev, unipi_circuit):
-    # Update state topic
-    topic = MQTT_HASS_TOPIC_FORMAT.format(
-        hass_type=hass_type,
-        unipi_name=unipi_name,
-        unipi_dev=unipi_dev,
-        unipi_circuit=unipi_circuit,
-        hass_action=HASS_ACTION.STATE,
-    )
-    client.publish(topic, message.payload)
-
-    # Send to websocket
-    value = 1 if message.payload == _settings().MQTT_PAYLOAD_ON else 0
-    logger.info(
-        "Push to output {dev}, {circuit}, {value}".format(
-            dev=unipi_dev, circuit=unipi_circuit, value=value,
-        )
-    )
-    asyncio.run(_ws_trigger(unipi_dev, unipi_circuit, value))
 
 
 def on_message(client, userdata, message):
@@ -277,48 +138,59 @@ def on_message(client, userdata, message):
     logger.info(
         f"Incoming MQTT message for topic {message.topic} with payload {message.payload}"
     )
-
-    if message.topic == MQTT_HASS_START_TOPIC:
-        _autodiscover_mqtt(client)
+    match = MQTT_COMMAND_TOPIC_REGEX.match(message.topic)
+    if match is None:
         return
 
-    match = MQTT_HASS_COMAND_TOPIC_REGEX.match(message.topic)
-    if match is not None:
-        _handle_output(
-            client,
-            message,
-            match.group("hass_type"),
-            match.group("unipi_name"),
-            match.group("unipi_dev"),
-            match.group("unipi_circuit"),
+    device_name = match.group("device_name")
+    dev = match.group("dev")
+    circuit = match.group("circuit")
+    if device_name != _settings().DEVICE_NAME:
+        logger.warning(
+            "Handling incoming message for device %s, expected %s",
+            device_name,
+            _settings().DEVICE_NAME,
         )
+
+    # Update state topic
+    client.publish(
+        MQTT_TOPIC_FORMAT.format(
+            device_name=device_name,
+            dev=dev,
+            circuit=circuit,
+            hass_action=HASS_ACTION.STATE,
+        ),
+        message.payload,
+    )
+
+    # Send to websocket
+    value = 1 if message.payload == _settings().MQTT_PAYLOAD_ON else 0
+    logger.info(f"Push to output {dev}, {circuit}, {value}")
+    asyncio.run(_ws_trigger(dev, circuit, value))
 
 
 def on_connect(client, userdata, message, rc):
     """Callback for when MQTT connection to broker is set up"""
-    logger.info("Pushing MQTT autodiscovery setup to HASS")
-    _autodiscover_mqtt(client)
-    logger.info("Subscribe to all relevant topics")
-    _subscribe_outputs_mqtt(client)
-    logger.info("Subscribe to HASS startup command")
-    client.subscribe(MQTT_HASS_START_TOPIC)
-    logger.info("Set all devices to available")
-    _toggle_availability(client, _settings().MQTT_PAYLOAD_ONLINE)
+    logger.info("Subscribe to all command topics")
+    _mqtt_client().subscribe(
+        "{device_name}/#".format(device_name=_settings().DEVICE_NAME)
+    )
 
 
 def _parser():
     """Generate argument parser"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("evok_uri", help="unipi websocket URI")
     parser.add_argument("mqtt_host", help="MQTT broker host")
-    parser.add_argument("unipi_name", help="Unique name for unipi device")
     parser.add_argument("--mqtt_port", type=int, default=1883)
     parser.add_argument("--mqtt_payload_on", default=b"ON")
     parser.add_argument("--mqtt_payload_off", default=b"OFF")
-    parser.add_argument("--mqtt_payload_online", default=b"online")
-    parser.add_argument("--mqtt_payload_offline", default=b"offline")
     parser.add_argument(
-        "--config_file", help="Configuration file", default="config.yaml"
+        "--device_name",
+        help="Unique name for unipi neuron device",
+        default=socket.gethostname(),
+    )
+    parser.add_argument(
+        "--websocket_uri", help="neuron websocket URI", default="ws://localhost/ws"
     )
     return parser
 
@@ -327,21 +199,14 @@ def main():
     # Parse
     args = _parser().parse_args()
 
-    # Read configs
-    logger.info("Read configs from file %s", args.config_file)
-    configs = _read_config(args.config_file)
-
     # Set settings first time and don't change them anymore
     _set_settings(
-        args.unipi_name,
-        args.evok_uri,
         args.mqtt_host,
         args.mqtt_port,
         args.mqtt_payload_on,
         args.mqtt_payload_off,
-        args.mqtt_payload_online,
-        args.mqtt_payload_offline,
-        configs,
+        args.device_name,
+        args.websocket_uri,
     )
 
     # MQTT initial setup
