@@ -17,7 +17,7 @@ LOG_LEVEL = logging.INFO
 LOG_CONFIG = dict(
     version=1,
     formatters={
-        "default": {"format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"}
+        "default": {"format": "%(asctime)s - %(kind)s - %(levelname)s - %(message)s"}
     },
     handlers={
         "stream": {
@@ -45,6 +45,12 @@ class HASS_ACTION:
     STATE = "state"
 
 
+class LOG_KIND:
+    SETTINGS = "settings"
+    WEBSOCKET = "websocket"
+    MQTT = "mqtt"
+
+
 _SETTINGS = None
 
 # Settings
@@ -70,7 +76,7 @@ def _set_settings(
     """
     global _SETTINGS
     if _SETTINGS is not None:
-        logger.warning("Updating settings")
+        logger.warning("Updating settings", extra={"kind": LOG_KIND.SETTINGS})
     _SETTINGS = Settings(
         mqtt_host,
         mqtt_port,
@@ -84,14 +90,19 @@ def _set_settings(
 def _settings():
     global _SETTINGS
     if _SETTINGS is None:
-        logger.warning("Settings haven't been initialized, this will probably not work")
+        logger.warning(
+            "Settings haven't been initialized, this will probably not work",
+            extra={"kind": LOG_KIND.SETTINGS},
+        )
     return _SETTINGS
 
 
 async def _ws_process(payload):
     """Process incoming websocket payload, push to MQTT"""
     obj = json.loads(payload)[0]
-    logger.debug("Incoming message for websocket %s", obj)
+    logger.debug(
+        "Incoming message for websocket %s", obj, extra={"kind": LOG_KIND.WEBSOCKET}
+    )
 
     topic = MQTT_TOPIC_FORMAT.format(
         device_name=_settings().DEVICE_NAME,
@@ -105,12 +116,21 @@ async def _ws_process(payload):
         else _settings().MQTT_PAYLOAD_OFF
     )
     _mqtt_client().publish(topic, payload=payload)
-    logger.info("MQTT publish %s to topic %s", payload, topic)
+    logger.info(
+        "MQTT publish %s to topic %s",
+        payload,
+        topic,
+        extra={"kind": LOG_KIND.WEBSOCKET},
+    )
 
 
 async def _ws_loop():
     """Main loop polling incoming events from websockets"""
-    logger.info("Connecting to %s", _settings().WEBSOCKET_URI)
+    logger.info(
+        "Connecting to %s",
+        _settings().WEBSOCKET_URI,
+        extra={"kind": LOG_KIND.WEBSOCKET},
+    )
     async with websockets.connect(_settings().WEBSOCKET_URI) as websocket:
         while True:
             payload = await websocket.recv()
@@ -129,14 +149,17 @@ def _mqtt_client():
     """Singleton MQTT client"""
     global _MQTT_CLIENT
     if _MQTT_CLIENT is None:
-        _MQTT_CLIENT = mqtt.Client(client_id=_settings().DEVICE_NAME)
+        _MQTT_CLIENT = mqtt.Client(
+            client_id=_settings().DEVICE_NAME, clean_session=None
+        )
     return _MQTT_CLIENT
 
 
 def on_message(client, userdata, message):
     """Callback for MQTT events"""
     logger.info(
-        f"Incoming MQTT message for topic {message.topic} with payload {message.payload}"
+        f"Incoming MQTT message for topic {message.topic} with payload {message.payload}",
+        extra={"kind": LOG_KIND.MQTT},
     )
     match = MQTT_COMMAND_TOPIC_REGEX.match(message.topic)
     if match is None:
@@ -150,6 +173,7 @@ def on_message(client, userdata, message):
             "Handling incoming message for device %s, expected %s",
             device_name,
             _settings().DEVICE_NAME,
+            extra={"kind": LOG_KIND.MQTT},
         )
 
     # Update state topic
@@ -165,16 +189,16 @@ def on_message(client, userdata, message):
 
     # Send to websocket
     value = 1 if message.payload == _settings().MQTT_PAYLOAD_ON else 0
-    logger.info(f"Push to output {dev}, {circuit}, {value}")
+    logger.info(
+        f"Push to output {dev}, {circuit}, {value}", extra={"kind": LOG_KIND.WEBSOCKET}
+    )
     asyncio.run(_ws_trigger(dev, circuit, value))
 
 
 def on_connect(client, userdata, message, rc):
     """Callback for when MQTT connection to broker is set up"""
-    logger.info("Subscribe to all command topics")
-    _mqtt_client().subscribe(
-        "{device_name}/#".format(device_name=_settings().DEVICE_NAME)
-    )
+    logger.debug("Subscribe to all command topics", extra={"kind": LOG_KIND.MQTT})
+    client.subscribe("{device_name}/#".format(device_name=_settings().DEVICE_NAME))
 
 
 def _parser():
@@ -210,13 +234,15 @@ def main():
     )
 
     # MQTT initial setup
-    logger.info("Connecting to MQTT broker %s", args.mqtt_host)
+    logger.info(
+        "Connecting to MQTT broker %s", args.mqtt_host, extra={"kind": LOG_KIND.MQTT}
+    )
     _mqtt_client().on_message = on_message
     _mqtt_client().on_connect = on_connect
-    _mqtt_client().connect(_settings().MQTT_HOST, _settings().MQTT_PORT)
+    _mqtt_client().connect(_settings().MQTT_HOST, _settings().MQTT_PORT, 60)
 
     # Loop
-    logger.info("Starting websocket poll loop")
+    logger.info("Starting websocket poll loop", extra={"kind": LOG_KIND.WEBSOCKET})
     _mqtt_client().loop_start()
     asyncio.get_event_loop().run_until_complete(_ws_loop())
 
