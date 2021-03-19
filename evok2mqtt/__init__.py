@@ -17,7 +17,7 @@ LOG_LEVEL = logging.INFO
 LOG_CONFIG = dict(
     version=1,
     formatters={
-        "default": {"format": "%(asctime)s - %(levelname)s - %(kind)9s - %(message)s"}
+        "default": {"format": "%(asctime)s - %(kind)s - %(levelname)s - %(message)s"}
     },
     handlers={
         "stream": {
@@ -61,7 +61,6 @@ Settings = collections.namedtuple(
         "MQTT_PORT",
         "MQTT_PAYLOAD_ON",
         "MQTT_PAYLOAD_OFF",
-        "MQTT_RETAIN",
         "DEVICE_NAME",
         "WEBSOCKET_URI",
     ),
@@ -69,13 +68,7 @@ Settings = collections.namedtuple(
 
 
 def _set_settings(
-    mqtt_host,
-    mqtt_port,
-    mqtt_payload_on,
-    mqtt_payload_off,
-    mqtt_retain,
-    device_name,
-    websocket_uri,
+    mqtt_host, mqtt_port, mqtt_payload_on, mqtt_payload_off, device_name, websocket_uri,
 ):
     """
     Put all settings in global scope, as they don't change after intialization
@@ -89,7 +82,6 @@ def _set_settings(
         mqtt_port,
         mqtt_payload_on,
         mqtt_payload_off,
-        mqtt_retain,
         device_name,
         websocket_uri,
     )
@@ -111,8 +103,6 @@ async def _ws_process(payload):
     logger.debug(
         "Incoming message for websocket %s", obj, extra={"kind": LOG_KIND.WEBSOCKET}
     )
-    if obj["dev"] in ("ai", "ao"):
-        return
 
     topic = MQTT_TOPIC_FORMAT.format(
         device_name=_settings().DEVICE_NAME,
@@ -125,9 +115,7 @@ async def _ws_process(payload):
         if obj["value"] == 1
         else _settings().MQTT_PAYLOAD_OFF
     )
-    _mqtt_client().publish(
-        topic, payload=payload, retain=_settings().MQTT_RETAIN,
-    )
+    _mqtt_client().publish(topic, payload=payload)
     logger.info(
         "MQTT publish %s to topic %s",
         payload,
@@ -162,7 +150,7 @@ def _mqtt_client():
     global _MQTT_CLIENT
     if _MQTT_CLIENT is None:
         _MQTT_CLIENT = mqtt.Client(
-            client_id=_settings().DEVICE_NAME, clean_session=None,
+            client_id=_settings().DEVICE_NAME, clean_session=None
         )
     return _MQTT_CLIENT
 
@@ -199,9 +187,7 @@ def on_message(client, userdata, message):
 def on_connect(client, userdata, message, rc):
     """Callback for when MQTT connection to broker is set up"""
     logger.debug("Subscribe to all command topics", extra={"kind": LOG_KIND.MQTT})
-    client.subscribe(
-        "{device_name}/+/+/set".format(device_name=_settings().DEVICE_NAME)
-    )
+    client.subscribe("{device_name}/#".format(device_name=_settings().DEVICE_NAME))
 
 
 def _parser():
@@ -211,7 +197,6 @@ def _parser():
     parser.add_argument("--mqtt_port", type=int, default=1883)
     parser.add_argument("--mqtt_payload_on", default=b"ON")
     parser.add_argument("--mqtt_payload_off", default=b"OFF")
-    parser.add_argument("--mqtt_retain", type=bool, default=True)
     parser.add_argument(
         "--device_name",
         help="Unique name for unipi neuron device",
@@ -233,7 +218,6 @@ def main():
         args.mqtt_port,
         args.mqtt_payload_on,
         args.mqtt_payload_off,
-        args.mqtt_retain,
         args.device_name,
         args.websocket_uri,
     )
