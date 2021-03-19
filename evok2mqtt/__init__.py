@@ -176,6 +176,17 @@ def on_message(client, userdata, message):
             extra={"kind": LOG_KIND.MQTT},
         )
 
+    # Update state topic
+    client.publish(
+        MQTT_TOPIC_FORMAT.format(
+            device_name=device_name,
+            dev=dev,
+            circuit=circuit,
+            hass_action=HASS_ACTION.STATE,
+        ),
+        message.payload,
+    )
+
     # Send to websocket
     value = 1 if message.payload == _settings().MQTT_PAYLOAD_ON else 0
     logger.info(
