@@ -7,7 +7,7 @@ license = "MIT"
 
 [tool.poetry.dependencies]
 python = "^3.7"
-websockets = "^8.1"
+websockets = "^9.1"
 paho-mqtt = "^1.5"
 
 [tool.poetry.dev-dependencies]
